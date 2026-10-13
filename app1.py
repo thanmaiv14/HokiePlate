@@ -245,7 +245,32 @@ def refresh_data():
         logger.error(f"Error refreshing data: {e}")
         return jsonify({"error": "Failed to refresh data"}), 500
 
-def create_ai_meal_plan(menu_data, calories, restrictions, macros, preferences):
+def create_ai_meal_plan(menu_data, calories, restrictions, macros, preferences, max_attempts=3):
+    """Ask the AI for a plan, check it against the targets in code, retry with feedback if it's off"""
+    protein_target = calories * macros.get('protein', 25) / 100 / 4
+    best_plan, best_score, feedback = None, None, ""
+    for attempt in range(1, max_attempts + 1):
+        plan = _ai_meal_plan_once(menu_data, calories, restrictions, macros, preferences, feedback)
+        if 'unavailable' in plan.get('notes', ''):
+            return plan
+        totals = recompute_totals(plan)
+        plan['totals'] = totals
+        cal_off = abs(totals['calories'] - calories) / calories
+        protein_off = abs(totals['protein'] - protein_target) / protein_target if protein_target else 0
+        score = 2 * cal_off + protein_off
+        logger.info(f"Attempt {attempt}: {totals['calories']} cal ({cal_off:.0%} off), "
+                    f"{totals['protein']}g protein ({protein_off:.0%} off)")
+        if best_score is None or score < best_score:
+            best_plan, best_score = plan, score
+        if cal_off <= 0.10 and protein_off <= 0.20:
+            break
+        feedback = (f"IMPORTANT: Your last plan was {totals['calories']:.0f} calories and "
+                    f"{totals['protein']:.0f}g protein. The target is {calories} calories and about "
+                    f"{protein_target:.0f}g protein. Add, remove, or swap items so the real sum of "
+                    f"the listed item values hits those targets.")
+    return best_plan
+
+def _ai_meal_plan_once(menu_data, calories, restrictions, macros, preferences, feedback=''):
     """Use OpenAI to create a personalized meal plan"""
     
     if not openai_client:
@@ -276,6 +301,7 @@ AVAILABLE FOODS TODAY AT VT DINING HALLS:
 Create a complete meal plan with breakfast, lunch, dinner, and optional snacks.
 Focus on creating balanced, realistic meals using ONLY the foods listed above.
 Ensure the total calories are within 10% of the target.
+{feedback}
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -305,7 +331,7 @@ Return ONLY valid JSON in this exact format:
     
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system", 
@@ -338,6 +364,7 @@ Return ONLY valid JSON in this exact format:
             logger.warning("AI returned invalid meal plan structure, using fallback")
             return create_fallback_meal_plan(menu_data, calories)
         
+        meal_plan['totals'] = recompute_totals(meal_plan)
         return meal_plan
         
     except json.JSONDecodeError as e:
@@ -346,6 +373,17 @@ Return ONLY valid JSON in this exact format:
     except Exception as e:
         logger.error(f"OpenAI API error: {e}")
         return create_fallback_meal_plan(menu_data, calories)
+
+def recompute_totals(meal_plan):
+    totals = {"calories": 0, "protein": 0, "carbs": 0, "fat": 0}
+    for items in meal_plan.get('meal_plan', {}).values():
+        for item in items or []:
+            for key in totals:
+                try:
+                    totals[key] += float(item.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+    return {k: round(v, 1) for k, v in totals.items()}
 
 def validate_meal_plan_structure(meal_plan):
     """Validate that meal plan has the expected structure"""
@@ -362,6 +400,12 @@ def validate_meal_plan_structure(meal_plan):
         return False
     
     return True
+
+def estimate_carbs(n):
+    if n.get('carbs'):
+        return n['carbs']
+    est = (n.get('calories', 0) - 4 * n.get('protein', 0) - 9 * n.get('fat', 0)) / 4
+    return max(0, round(est))
 
 def format_foods_for_ai(menu_data):
     """Format menu data for AI prompt - prioritize real meals"""
@@ -385,7 +429,7 @@ def format_foods_for_ai(menu_data):
                 name_lower = item['name'].lower()
                 food_line = (f"{item['name']} ({hall_name}, {meal_period.title()}) - "
                            f"Cal: {calories}, P: {nutrition.get('protein', 0)}g, "
-                           f"C: {nutrition.get('carbs', 0)}g, F: {nutrition.get('fat', 0)}g")
+                           f"C: {estimate_carbs(nutrition)}g, F: {nutrition.get('fat', 0)}g")
                 
                 # Skip cereals, milk, juice completely
                 if any(word in name_lower for word in ['cereal', 'milk', 'juice', 'dispenser']):
